@@ -52,6 +52,7 @@
   .chip { font-size: 12px; font-weight: 700; padding: 4px 8px; border-radius: 999px; white-space: nowrap; }
   .chip.ok { background: rgba(22,163,74,.2); color: #4ade80; }
   .chip.bad { background: rgba(220,38,38,.2); color: #f87171; }
+  .chip.warn { background: rgba(217,119,6,.25); color: #fbbf24; }
 
   nav { display: flex; gap: 8px; padding: 10px 16px; padding-bottom: max(10px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); }
   nav button { flex: 1; min-height: 48px; background: transparent; color: var(--muted); font-weight: 700; font-size: 16px; }
@@ -91,7 +92,7 @@
   </section>
 
   <section id="viewSearch" hidden>
-    <div class="notice" style="margin-bottom:12px">Ручная проверка: если QR не открывается, найдите ученика по фамилии или номеру регистрации (R-0001).</div>
+    <div class="notice" style="margin-bottom:12px">Ручная проверка: начните вводить фамилию или номер (R-0001) — список появится сразу. Только что зарегистрировался и его нет в списке? Нажмите «Найти». «Ждёт оплаты» — проверьте чек и пропустите.</div>
     <form class="search" id="searchForm" autocomplete="off">
       <input id="searchInput" type="search" placeholder="Фамилия или R-0001" enterkeyhint="search">
       <button class="btn primary" type="submit">Найти</button>
@@ -127,14 +128,15 @@ const EVENT_ID = '7-9';
 const KEY_STORAGE = 'ballpass_key' + (EVENT_ID ? '_' + EVENT_ID : '');
 const WHO_STORAGE = 'ballpass_who';
 const TOKEN_RE = /^BP-[0-9a-f]{32}$/;
-const REQUEST_TIMEOUT_MS = 15000;
-const SAME_CODE_IGNORE_MS = 5000;
-const AUTO_NEXT_AFTER_ADMIT_MS = 1200;
-const PING_EVERY_MS = 120000;
+const REQUEST_TIMEOUT_MS = 12000;
+const SAME_CODE_IGNORE_MS = 4000; // counted from when the result screen closes
+const AUTO_NEXT_OK_MS = 1200;
+const AUTO_NEXT_BAD_MS = 4000;
+const PING_EVERY_MS = 45000; // also keeps the server warm
 
 const VIEWS = {
   CHECKING: { tone: 'wait', icon: '…', title: 'Проверка…' },
-  ADMITTING: { tone: 'wait', icon: '…', title: 'Отмечаю вход…' },
+  ADMITTING: { tone: 'wait', icon: '…', title: 'Проверка…' },
   VALID: { tone: 'ok', icon: '✓', title: 'Билет действителен' },
   ADMITTED: { tone: 'ok', icon: '✓', title: 'Проходите!' },
   USED: { tone: 'bad', icon: '✕', title: 'Уже использован' },
@@ -142,14 +144,16 @@ const VIEWS = {
   NOT_PAID: { tone: 'bad', icon: '✕', title: 'Оплата не подтверждена' },
   REVOKED: { tone: 'bad', icon: '✕', title: 'Билет отозван' },
   NOT_BALLPASS: { tone: 'bad', icon: '✕', title: 'Это не билет BallPass' },
-  ERROR: { tone: 'warn', icon: '!', title: 'Не пропускать' },
+  PAY_CHECK: { tone: 'warn', icon: '₸', title: 'Проверьте чек' },
+  ERROR: { tone: 'warn', icon: '!', title: 'Повторите' },
   DENIED: { tone: 'warn', icon: '!', title: 'Доступ отключён' },
 };
 
 const state = {
   key: null, me: '', who: '', tab: 'scan', busy: false,
   lastCode: '', lastCodeAt: 0, scanner: null, cameraOn: false,
-  uncertainAdmit: '', stats: null, wakeLock: null,
+  uncertainAdmit: '', stats: null, wakeLock: null, closable: false,
+  roster: null, shown: null, shownHint: '',
 };
 
 const $ = id => document.getElementById(id);
@@ -212,6 +216,7 @@ async function ping() {
       state.me = r.organizer || '';
       $('who').textContent = (state.who ? state.who + ' · ' : '') + state.me;
       setStats(r.stats);
+      setRoster(r.people);
     }
     return r;
   } catch (e) {
@@ -241,7 +246,13 @@ function feedback(tone) {
 }
 
 // ---------------------------------------------------------------- overlay
-function showResult(kind, data, actions, detailOverride) {
+let overlayTimer = null;
+
+/** autoCloseMs: go back to the camera by itself (green / red); tapping the screen closes it sooner. */
+function showResult(kind, data, actions, detailOverride, autoCloseMs) {
+  clearTimeout(overlayTimer);
+  state.closable = !!autoCloseMs;
+  if (autoCloseMs) overlayTimer = setTimeout(next, autoCloseMs);
   const v = VIEWS[kind] || VIEWS.ERROR;
   const ov = $('overlay');
   ov.className = v.tone;
@@ -271,8 +282,10 @@ function showResult(kind, data, actions, detailOverride) {
 }
 
 function next() {
+  clearTimeout(overlayTimer);
   $('overlay').hidden = true;
   state.busy = false;
+  state.lastCodeAt = Date.now(); // the same QR still in front of the camera is ignored for a moment
 }
 
 const NEXT = { label: 'Следующий', onClick: next };
@@ -286,10 +299,10 @@ function onScan(text) {
   state.lastCodeAt = Date.now();
   if (!TOKEN_RE.test(code)) {
     state.busy = true;
-    showResult('NOT_BALLPASS', null, [NEXT]);
+    showResult('NOT_BALLPASS', null, [NEXT], '', AUTO_NEXT_BAD_MS);
     return;
   }
-  runCheck({ token: code });
+  runAdmit({ token: code }); // QR: one call — a valid ticket is admitted right away
 }
 
 async function runCheck(ref) {
@@ -303,6 +316,8 @@ async function runCheck(ref) {
     return;
   }
   if (r.status === 'DENIED') return showDenied(r.message);
+  rememberStatus(r);
+  if (r.status === 'NOT_PAID' && r.pending && ref.regId) return showPayCheck(r);
   if (r.status === 'VALID') {
     showResult('VALID', r, [
       { label: 'Пропустить', primary: true, onClick: () => runAdmit(ref) },
@@ -314,59 +329,112 @@ async function runCheck(ref) {
     showResult('ERROR', null, [{ label: 'Повторить', primary: true, onClick: () => runCheck(ref) }, NEXT], r.message);
     return;
   }
-  showResult(r.status, r, [NEXT]);
+  showResult(r.status, r, [NEXT], '', AUTO_NEXT_BAD_MS);
 }
 
-async function runAdmit(ref) {
+/**
+ * Validates and admits in one server call. On a timeout or "busy" it retries once by itself —
+ * safe, because a ticket this volunteer already admitted comes back as USED with self = true.
+ */
+async function runAdmit(ref, isRetry) {
+  state.busy = true;
   const refKey = JSON.stringify(ref);
   showResult('ADMITTING', null, []);
+  const retry = { label: 'Повторить', primary: true, onClick: () => runAdmit(ref) };
   let r;
   try {
     r = await api('admit', ref);
   } catch (err) {
     state.uncertainAdmit = refKey; // the server may or may not have recorded it
-    showResult('ERROR', null, [{ label: 'Повторить', primary: true, onClick: () => runAdmit(ref) }, NEXT],
-      err.message + '. Неизвестно, отмечен ли вход — нажмите «Повторить».');
+    if (!isRetry) return runAdmit(ref, true);
+    showResult('ERROR', null, [retry, NEXT], err.message + '. Не пропускайте, пока не станет зелёным.');
     return;
   }
   if (r.status === 'DENIED') return showDenied(r.message);
+  if (r.status !== 'ERROR') rememberStatus(r);
 
-  // Retry after a lost response: the server already admitted it — by this volunteer.
-  // Compared by the volunteer's own name, because a shared link has the same organizer name on every phone.
-  const myLabel = (state.who ? state.who + ' · ' : '') + state.me;
-  const admittedBy = String(r.admittedBy || '');
-  const admittedByMeEarlier = r.status === 'USED' && state.uncertainAdmit === refKey && state.who && state.me &&
-    (admittedBy === myLabel || admittedBy === myLabel + ' (вручную)');
+  const admittedByMeEarlier = r.status === 'USED' && r.self === true && state.uncertainAdmit === refKey;
   if (r.status === 'ADMITTED' || admittedByMeEarlier) {
     state.uncertainAdmit = '';
     if (state.stats && r.status === 'ADMITTED') setStats({ admitted: state.stats.admitted + 1, approved: state.stats.approved });
-    showResult('ADMITTED', r, [NEXT], admittedByMeEarlier ? 'Вход уже был отмечен вами в ' + r.entryTime : 'Вход ' + (r.entryTime || ''));
-    state.lastCode = ref.token || state.lastCode;
-    state.lastCodeAt = Date.now();
-    setTimeout(() => { if ($('overlay').className === 'ok' && !$('overlay').hidden) next(); }, AUTO_NEXT_AFTER_ADMIT_MS);
+    showResult('ADMITTED', r, [], admittedByMeEarlier ? 'Вход уже был отмечен вами в ' + r.entryTime : 'Вход ' + (r.entryTime || ''), AUTO_NEXT_OK_MS);
     return;
   }
   if (r.status === 'ERROR') {
-    showResult('ERROR', null, [{ label: 'Повторить', primary: true, onClick: () => runAdmit(ref) }, NEXT], r.message);
+    state.uncertainAdmit = refKey;
+    if (!isRetry) return runAdmit(ref, true);
+    showResult('ERROR', null, [retry, NEXT], r.message);
     return;
   }
-  showResult(r.status, r, [NEXT]);
+  state.uncertainAdmit = '';
+  showResult(r.status, r, [NEXT], '', AUTO_NEXT_BAD_MS);
 }
 
 // ---------------------------------------------------------------- search
+// The list from the last ping is kept in memory (never stored), so typing filters instantly.
+// «Найти» asks the server — for someone approved in the last minute. Admission is always re-checked by the server.
+const SEARCH_LIMIT = 20;
+
+function toPerson(p) {
+  return { regId: p.regId, name: p.name || '', klass: p.klass || '', status: p.status, entryTime: p.entryTime || '', admittedBy: p.admittedBy || '', pending: !!p.pending };
+}
+
+function setRoster(people) {
+  if (!Array.isArray(people)) return;
+  state.roster = people.map(p => toPerson({ regId: p.r, name: p.n, klass: p.k, status: p.s, entryTime: p.t, admittedBy: p.b, pending: p.p }));
+  refreshResults();
+}
+
+/** Puts fresher server answers into the list; returns the list entries. */
+function mergeIntoRoster(items) {
+  state.roster = state.roster || [];
+  return items.map(item => {
+    const p = toPerson(item);
+    const i = state.roster.findIndex(x => x.regId === p.regId);
+    if (i === -1) state.roster.push(p); else state.roster[i] = p;
+    return p;
+  });
+}
+
+/** Updates one person's status after a check/admit answer. */
+function rememberStatus(r) {
+  if (!state.roster || !r || !r.regId) return;
+  const p = state.roster.find(x => x.regId === r.regId);
+  if (!p) return;
+  p.status = r.status === 'ADMITTED' ? 'USED' : r.status;
+  p.pending = p.status === 'NOT_PAID' && !!r.pending;
+  if (p.status === 'USED') { p.entryTime = r.entryTime || p.entryTime; p.admittedBy = r.admittedBy || p.admittedBy; }
+  refreshResults();
+}
+
+function localSearch() {
+  const q = $('searchInput').value.trim().toLowerCase();
+  if (q.length < 2) { renderResults(null); return; }
+  if (!state.roster) { renderResults(null, 'Список ещё не загрузился — нажмите «Найти»'); return; }
+  const found = state.roster.filter(p => p.name.toLowerCase().indexOf(q) !== -1 || p.regId.toLowerCase() === q);
+  renderResults(found.slice(0, SEARCH_LIMIT), 'Нет в списке — нажмите «Найти», проверю на сервере');
+}
+
 async function runSearch(e) {
   e.preventDefault();
   const q = $('searchInput').value.trim();
-  const box = $('results');
-  if (q.length < 2) { box.innerHTML = '<p class="hint">Введите минимум 2 буквы</p>'; return; }
-  box.innerHTML = '<p class="hint">Поиск…</p>';
+  if (q.length < 2) { renderResults(null, 'Введите минимум 2 буквы'); return; }
+  renderResults(null, 'Поиск на сервере…');
   let r;
-  try { r = await api('search', { query: q }); } catch (err) { box.innerHTML = ''; box.appendChild(hint(err.message)); return; }
+  try { r = await api('search', { query: q }); } catch (err) { renderResults(null, err.message); return; }
   if (r.status === 'DENIED') return showDenied(r.message);
-  if (r.status !== 'OK') { box.innerHTML = ''; box.appendChild(hint(r.message || 'Ошибка')); return; }
+  if (r.status !== 'OK') { renderResults(null, r.message || 'Ошибка'); return; }
+  renderResults(mergeIntoRoster(r.results), 'Ничего не найдено');
+}
+
+/** list = null shows only the hint; otherwise the people (or emptyHint if none). */
+function renderResults(list, emptyHint) {
+  state.shown = list ? list.map(p => p.regId) : null;
+  state.shownHint = emptyHint || '';
+  const box = $('results');
   box.textContent = '';
-  if (!r.results.length) { box.appendChild(hint('Ничего не найдено')); return; }
-  r.results.forEach(item => {
+  if (!list || !list.length) { if (emptyHint) box.appendChild(hint(emptyHint)); return; }
+  list.forEach(item => {
     const b = document.createElement('button');
     b.className = 'item';
     const main = document.createElement('div'); main.className = 'main';
@@ -375,12 +443,45 @@ async function runSearch(e) {
     meta.textContent = 'Класс ' + item.klass + ' · ' + item.regId + (item.status === 'USED' ? ' · вход ' + item.entryTime : '');
     main.append(name, meta);
     const chip = document.createElement('span');
-    chip.className = 'chip ' + (item.status === 'VALID' ? 'ok' : 'bad');
-    chip.textContent = { VALID: 'можно', USED: 'уже вошёл', NOT_PAID: 'не оплачено', REVOKED: 'отозван', INVALID: 'нет билета' }[item.status] || item.status;
+    const awaiting = item.status === 'NOT_PAID' && item.pending;
+    chip.className = 'chip ' + (item.status === 'VALID' ? 'ok' : awaiting ? 'warn' : 'bad');
+    chip.textContent = awaiting ? 'ждёт оплаты'
+      : { VALID: 'можно', USED: 'уже вошёл', NOT_PAID: 'отклонено', REVOKED: 'отозван', INVALID: 'нет билета' }[item.status] || item.status;
     b.append(main, chip);
-    b.addEventListener('click', () => { unlockAudio(); runCheck({ regId: item.regId }); });
+    b.addEventListener('click', () => pickResult(item));
     box.appendChild(b);
   });
+}
+
+/** Re-draws the shown results with fresh statuses (after a ping or an admission). */
+function refreshResults() {
+  if (!state.shown || !state.roster) return;
+  const list = state.shown.map(id => state.roster.find(p => p.regId === id)).filter(Boolean);
+  renderResults(list, state.shownHint);
+}
+
+function pickResult(item) {
+  unlockAudio();
+  if (item.status === 'VALID') {
+    // No extra call: «Пропустить» goes straight to admit, which re-checks on the server.
+    state.busy = true;
+    showResult('VALID', item, [
+      { label: 'Пропустить', primary: true, onClick: () => runAdmit({ regId: item.regId }) },
+      { label: 'Отмена', onClick: next },
+    ]);
+    return;
+  }
+  if (item.status === 'NOT_PAID' && item.pending) { showPayCheck(item); return; }
+  runCheck({ regId: item.regId }); // e.g. "отклонено" — ask the server, the status may have changed
+}
+
+/** Payment not approved in the sheet yet: the volunteer checks the receipt on the student's phone. */
+function showPayCheck(item) {
+  state.busy = true;
+  showResult('PAY_CHECK', item, [
+    { label: 'Чек проверен — пропустить', primary: true, onClick: () => runAdmit({ regId: item.regId, paidAtDoor: true }) },
+    { label: 'Отмена', onClick: next },
+  ], 'Оплата не подтверждена в таблице. Посмотрите чек на телефоне ученика: сумма и дата.');
 }
 
 function hint(text) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = text; return p; }
@@ -440,6 +541,7 @@ function showLogin(html) {
 }
 
 function showDenied(message) {
+  clearTimeout(overlayTimer);
   $('overlay').hidden = true;
   state.busy = true;
   stopCamera();
@@ -511,7 +613,9 @@ $('btnCamera').addEventListener('click', () => { unlockAudio(); startCamera(); }
 $('tabScan').addEventListener('click', () => { unlockAudio(); showTab('scan'); });
 $('tabSearch').addEventListener('click', () => { unlockAudio(); showTab('search'); });
 $('tabExit').addEventListener('click', logout);
+$('overlay').addEventListener('click', e => { if (state.closable && !e.target.closest('button')) next(); });
 $('searchForm').addEventListener('submit', runSearch);
+$('searchInput').addEventListener('input', localSearch);
 document.addEventListener('click', unlockAudio, { once: true });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') { keepScreenOn(); if (state.key) ping(); }
